@@ -7,4 +7,5 @@ require (
 	github.com/tarm/serial v0.0.0-20180830185346-98f6abe2eb07 // indirect
 	golang.org/x/net v0.17.0 // indirect
 	golang.org/x/sys v0.13.0 // indirect
+	golang.org/x/text v0.16.0 // indirect
 )
