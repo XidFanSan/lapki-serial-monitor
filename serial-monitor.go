@@ -1,15 +1,16 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 	"github.com/tarm/serial"
@@ -21,18 +22,7 @@ type SerialSettings struct {
 	BaudRate int    `json:"baudRate"`
 }
 
-// Структура для передачи команд от клиента
-type Command struct {
-	Command string `json:"command"`
-}
-
-// Структура для сообщений клиенту
-type ClientMessage struct {
-	Type    string `json:"type"`
-	Message string `json:"message"`
-}
-
-// Конфигурация для WebSocket с увеличенными буферами чтения и записи
+// Конфигурация для WebSocket
 var (
 	websocketUpgrader = websocket.Upgrader{
 		ReadBufferSize:  1024,
@@ -58,10 +48,9 @@ func main() {
 	go manageSerialConnection()
 	go writeToSerial()
 
-	log.Println("Server started on :8080")
-	err := http.ListenAndServe(":8080", nil)
-	if err != nil {
-		log.Fatal("ListenAndServe: ", err)
+	log.Println("Запускаем сервер :8080")
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		log.Fatal("Ошибка запуска сервера: ", err)
 	}
 }
 
@@ -76,7 +65,7 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 	}
 	defer ws.Close()
 
-	log.Println("Новый клиент подключён")
+	log.Println("Новый клиент подключён.")
 	clients[ws] = true
 
 	for {
@@ -85,7 +74,7 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				log.Printf("Ошибка чтения сообщения: %v", err)
 			} else {
-				log.Println("Клиент отключён")
+				log.Println("Клиент отключён.")
 			}
 			break
 		}
@@ -96,43 +85,60 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		if port, ok := message["port"]; ok {
-			if baudRate, ok := message["baudRate"]; ok {
-				portStr, portOk := port.(string)
-				baudRateStr, baudRateOk := baudRate.(string)
-				baudRateInt, err := strconv.Atoi(baudRateStr)
-				if err != nil {
-					log.Printf("Ошибка преобразования скорости передачи: %v", err)
-					continue
-				}
-				if portOk && baudRateOk {
-					currentSettings = SerialSettings{
-						Port:     portStr,
-						BaudRate: baudRateInt,
-					}
-					log.Printf("Изменены настройки: порт %s, скорость передачи %d", portStr, baudRateInt)
-					// Закрываем предыдущее соединение и открываем новое
-					reconnectSerialPort()
-				} else {
-					log.Println("Ошибка: неверные типы данных для порта и скорости передачи")
-				}
-			}
-		} else if command, ok := message["command"]; ok {
-			if commandStr, commandOk := command.(string); commandOk {
-				serialWriteChan <- commandStr + "\n"
-			} else {
-				log.Println("Ошибка: неверный тип данных для команды")
-			}
-		}
+		processSettings(message)
 	}
 
 	delete(clients, ws)
 }
 
+// Переопределение настроек и получение команд от клиента
+func processSettings(message map[string]interface{}) {
+	port, portOk := message["port"]
+	baudRate, baudRateOk := message["baudRate"]
+
+	if portOk && baudRateOk {
+		portStr, portValid := port.(string)
+		baudRateStr, baudRateValid := baudRate.(string)
+
+		if portValid && baudRateValid {
+			baudRateInt, err := strconv.Atoi(baudRateStr)
+			if err == nil {
+				if currentSettings.Port != portStr || currentSettings.BaudRate != baudRateInt {
+					currentSettings = SerialSettings{
+						Port:     portStr,
+						BaudRate: baudRateInt,
+					}
+					log.Printf("Изменены настройки: порт %s, скорость передачи %d", portStr, baudRateInt)
+					notifyClients(fmt.Sprintf("Изменены настройки: порт %s, скорость передачи %d", portStr, baudRateInt))
+					reconnectSerialPort()
+				} else {
+					notifyClients("Настройки порта и скорости передачи не изменились.")
+				}
+			} else {
+				notifyClients("Ошибка преобразования скорости передачи.")
+			}
+		} else {
+			if !portValid {
+				notifyClients("Ошибка: неверный тип данных для порта.")
+			}
+			if !baudRateValid {
+				notifyClients("Ошибка: неверный тип данных для скорости передачи.")
+			}
+		}
+	} else if command, ok := message["command"]; ok {
+		if commandStr, commandOk := command.(string); commandOk {
+			serialWriteChan <- commandStr + "\n"
+		} else {
+			notifyClients("Ошибка: неверный тип данных для команды.")
+		}
+	}
+}
+
+// Функция переподключения к последовательному порту, если плата была переподключена или перезагружена
 func manageSerialConnection() {
 	for {
 		if serialPort == nil {
-			log.Println("Ошибка: последовательный порт не открыт")
+			log.Println("Ошибка: последовательный порт не открыт.")
 			time.Sleep(5 * time.Second)
 			continue
 		}
@@ -156,6 +162,9 @@ func reconnectSerialPort() {
 		serialPort.Close()
 	}
 
+	// Небольшая пауза перед повторной попыткой открыть порт
+	time.Sleep(1 * time.Second)
+
 	// Открываем новое соединение
 	openSerialPort()
 }
@@ -163,71 +172,47 @@ func reconnectSerialPort() {
 // Открываем порт заново, если он был закрыт
 func openSerialPort() {
 	if currentSettings.Port == "" {
-		log.Println("Порт не выбран")
+		notifyClients("Порт не выбран.")
 		return
 	}
 	c := &serial.Config{Name: currentSettings.Port, Baud: currentSettings.BaudRate}
 	var err error
 	serialPort, err = serial.OpenPort(c)
 	if err != nil {
-		log.Printf("Не удалось открыть последовательный порт: %v", err)
-		notifyClients("Ошибка: не удалось открыть последовательный порт. Пожалуйста, проверьте настройки и переподключитесь к порту.")
+		notifyClients("Ошибка: не удалось открыть последовательный порт. Проверьте настройки и переподключитесь к порту.")
 		return
 	}
-	go readFromSerial()
-	notifyClients("Подключение к последовательному порту успешно. Начинается отправка сообщения с последовательного порта...")
-}
-
-// Структура отправляемого сообщения клиенту
-func notifyClients(message string) {
-	for client := range clients {
-		err := client.WriteMessage(websocket.TextMessage, []byte(message))
-		if err != nil {
-			log.Printf("Ошибка отправки сообщения клиенту: %v", err)
+	go func() {
+		if err := readFromSerial(); err != nil {
+			log.Printf("Ошибка при чтении из последовательного порта: %v", err)
 		}
-	}
+	}()
+	notifyClients("Подключение к последовательному порту успешно!")
 }
 
 // Получаем ответ из последовательного порта
 func readFromSerial() error {
 	// Проверяем наличие порта
 	if serialPort == nil {
-		errMsg := "Ошибка: последовательный порт не открыт"
+		errMsg := "Ошибка: последовательный порт не открыт."
 		notifyClients(errMsg)
 		return errors.New("ошибка: последовательный порт не открыт")
 	}
 
-	// Буфер для чтения данных из порта
-	buf := make([]byte, 128)
-	var messageBuffer bytes.Buffer
-
+	reader := bufio.NewReader(serialPort)
 	for {
-		n, err := serialPort.Read(buf)
+		receivedMsg, err := reader.ReadString('\n') // Читаем до символа новой строки
 		if err != nil {
-			log.Printf("Не удалось прочитать из последовательного порта: %v", err)
+			log.Printf("Ошибка при чтении из последовательного порта: %v", err)
 			return err
 		}
 
-		// Обрабатываем полученные данные
-		data := buf[:n]
-		if !utf8.Valid(data) {
-			log.Printf("Недействительная строка UTF-8: %x", data)
-			continue
+		receivedMsg = strings.TrimSpace(receivedMsg) // Удаляем пробельные символы
+		if receivedMsg != "" {
+			broadcast <- receivedMsg // Отправляем сообщение клиентам
+			log.Println("Получен ответ из последовательного порта:", receivedMsg)
 		}
-
-		// Добавляем данные в буфер сообщений
-		messageBuffer.Write(data)
-
-		// Парсим сообщения из буфера
-		for {
-			if i := bytes.IndexByte(messageBuffer.Bytes(), '\n'); i >= 0 {
-				message := messageBuffer.Next(i + 1)
-				broadcast <- string(message)
-				log.Println("Получен ответ из последовательного порта:", string(message))
-			} else {
-				break
-			}
-		}
+		time.Sleep(100 * time.Millisecond) // Добавляем небольшую задержку
 	}
 }
 
@@ -265,6 +250,16 @@ func handleMessages() {
 				client.Close()
 				delete(clients, client)
 			}
+		}
+	}
+}
+
+// Структура отправляемого сообщения клиенту
+func notifyClients(message string) {
+	for client := range clients {
+		err := client.WriteMessage(websocket.TextMessage, []byte(message))
+		if err != nil {
+			log.Printf("Ошибка отправки сообщения клиенту: %v", err)
 		}
 	}
 }
