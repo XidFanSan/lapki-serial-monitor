@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -39,9 +41,13 @@ var (
 	// Глобальная переменная для хранения текущих настроек
 	currentSettings SerialSettings
 	serialPort      *serial.Port
+	// адрес на котором будет работать этот сервер
+	webAddress string
 )
 
 func main() {
+	flag.StringVar(&webAddress, "address", ":8080", "адрес для подключения")
+
 	http.HandleFunc("/serialmonitor", handleConnections)
 
 	go handleMessages()
@@ -49,8 +55,22 @@ func main() {
 	go writeToSerial()
 
 	log.Println("Запускаем сервер :8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatal("Ошибка запуска сервера: ", err)
+	log.Fatal(http.ListenAndServe(webAddress, nil))
+}
+
+// Отправление сообщения клиенту
+func handleMessages() {
+	for {
+		msg := <-broadcast
+
+		for client := range clients {
+			err := client.WriteMessage(websocket.TextMessage, []byte(msg))
+			if err != nil {
+				log.Printf("Ошибка записи сообщения клиенту: %v", err)
+				client.Close()
+				delete(clients, client)
+			}
+		}
 	}
 }
 
@@ -67,6 +87,9 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 
 	log.Println("Новый клиент подключён.")
 	clients[ws] = true
+
+	//Отправляем первоначальное сообщение о портах
+	sendPortList()
 
 	for {
 		_, msg, err := ws.ReadMessage()
@@ -108,50 +131,77 @@ func processSettings(message map[string]interface{}) {
 						Port:     portStr,
 						BaudRate: baudRateInt,
 					}
-					log.Printf("Изменены настройки: порт %s, скорость передачи %d", portStr, baudRateInt)
-					notifyClients(fmt.Sprintf("Изменены настройки: порт %s, скорость передачи %d", portStr, baudRateInt))
+					broadcast <- fmt.Sprintf("Изменены настройки: порт %s, скорость передачи %d", portStr, baudRateInt)
 					reconnectSerialPort()
 				} else {
-					notifyClients("Настройки порта и скорости передачи не изменились.")
+					broadcast <- "Настройки порта и скорости передачи не изменились."
 				}
 			} else {
-				notifyClients("Ошибка преобразования скорости передачи.")
+				broadcast <- "Ошибка преобразования скорости передачи."
 			}
 		} else {
 			if !portValid {
-				notifyClients("Ошибка: неверный тип данных для порта.")
+				broadcast <- "Ошибка: неверный тип данных для порта."
 			}
 			if !baudRateValid {
-				notifyClients("Ошибка: неверный тип данных для скорости передачи.")
+				broadcast <- "Ошибка: неверный тип данных для скорости передачи."
 			}
 		}
 	} else if command, ok := message["command"]; ok {
 		if commandStr, commandOk := command.(string); commandOk {
 			serialWriteChan <- commandStr + "\n"
 		} else {
-			notifyClients("Ошибка: неверный тип данных для команды.")
+			broadcast <- "Ошибка: неверный тип данных для команды."
 		}
 	}
 }
 
-// Функция переподключения к последовательному порту, если плата была переподключена или перезагружена
+// Функция для переподключения, а также для обновления данных(список портов и т.д.)
 func manageSerialConnection() {
+	// Получаем текущий список портов
+	lastPortList := getPortNames()
 	for {
-		if serialPort == nil {
-			log.Println("Ошибка: последовательный порт не открыт.")
-			time.Sleep(5 * time.Second)
-			continue
+		// Получаем текущий список портов
+		portList := getPortNames()
+		if !equalPortLists(portList, lastPortList) {
+			sendPortList()
+			// Проверяем, если текущий порт больше недоступен, сбрасываем настройки и переподключаемся
+			if !stringInSlice(currentSettings.Port, portList) {
+				if len(portList) < len(lastPortList) {
+					currentSettings = SerialSettings{}
+					broadcast <- "Текущий порт больше не доступен. Настройки сброшены."
+				}
+
+				reconnectSerialPort()
+			}
+			// Обновляем последний известный список портов
+			lastPortList = portList
 		}
+		time.Sleep(2 * time.Second)
+	}
+}
 
-		if err := readFromSerial(); err != nil {
-			log.Printf("Ошибка последовательного порта: %v", err)
-			log.Println("Попытка переподключения к последовательному порту через 5 секунд...")
-			time.Sleep(5 * time.Second)
-
-			// Переподключаемся при ошибке чтения
-			reconnectSerialPort()
+// Функция для проверки наличия строки в слайсе
+func stringInSlice(str string, list []string) bool {
+	for _, v := range list {
+		if str == v {
+			return true
 		}
 	}
+	return false
+}
+
+// Функция для проверки наличия списка портов в слайсе
+func equalPortLists(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func reconnectSerialPort() {
@@ -172,47 +222,46 @@ func reconnectSerialPort() {
 // Открываем порт заново, если он был закрыт
 func openSerialPort() {
 	if currentSettings.Port == "" {
-		notifyClients("Порт не выбран.")
+		broadcast <- "Порт не выбран."
 		return
 	}
 	c := &serial.Config{Name: currentSettings.Port, Baud: currentSettings.BaudRate}
 	var err error
 	serialPort, err = serial.OpenPort(c)
 	if err != nil {
-		notifyClients("Ошибка: не удалось открыть последовательный порт. Проверьте настройки и переподключитесь к порту.")
+		broadcast <- "Ошибка: не удалось открыть последовательный порт. Проверьте настройки и переподключитесь к порту."
 		return
 	}
 	go func() {
-		if err := readFromSerial(); err != nil {
-			log.Printf("Ошибка при чтении из последовательного порта: %v", err)
-		}
+		readFromSerial()
 	}()
-	notifyClients("Подключение к последовательному порту успешно!")
+	broadcast <- fmt.Sprintf("Подключение к последовательному порту %s со скоростью %d успешно!", currentSettings.Port, currentSettings.BaudRate)
 }
 
 // Получаем ответ из последовательного порта
 func readFromSerial() error {
 	// Проверяем наличие порта
 	if serialPort == nil {
-		errMsg := "Ошибка: последовательный порт не открыт."
-		notifyClients(errMsg)
+		broadcast <- "Ошибка: последовательный порт не открыт."
 		return errors.New("ошибка: последовательный порт не открыт")
 	}
 
 	reader := bufio.NewReader(serialPort)
 	for {
-		receivedMsg, err := reader.ReadString('\n') // Читаем до символа новой строки
+		// Читаем до символа новой строки
+		receivedMsg, err := reader.ReadString('\n')
 		if err != nil {
-			log.Printf("Ошибка при чтении из последовательного порта: %v", err)
+			broadcast <- fmt.Sprintf("Ошибка при чтении из последовательного порта: %v", err)
 			return err
 		}
-
-		receivedMsg = strings.TrimSpace(receivedMsg) // Удаляем пробельные символы
+		// Удаляем пробельные символы
+		receivedMsg = strings.TrimSpace(receivedMsg)
 		if receivedMsg != "" {
-			broadcast <- receivedMsg // Отправляем сообщение клиентам
-			log.Println("Получен ответ из последовательного порта:", receivedMsg)
+			// Отправляем сообщение клиентам
+			broadcast <- receivedMsg
 		}
-		time.Sleep(100 * time.Millisecond) // Добавляем небольшую задержку
+		// Добавляем небольшую задержку перед чтением нового сообщения
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -221,45 +270,65 @@ func writeToSerial() {
 	for {
 		msg := <-serialWriteChan
 		if serialPort == nil {
-			errMsg := "Ошибка: порт не открыт. Сообщение не отправлено."
-			notifyClients(errMsg)
+			broadcast <- "Ошибка: порт не открыт. Сообщение не отправлено."
 			continue
 		}
 
 		_, err := serialPort.Write([]byte(msg))
 		if err != nil {
-			errMsg := "Ошибка записи в последовательный порт: " + err.Error()
-			notifyClients(errMsg)
+			broadcast <- "Ошибка записи в последовательный порт: " + err.Error()
 		} else {
-			errMsg := "Записано в последовательный порт: " + msg
-			notifyClients(errMsg)
+			broadcast <- "Отправлено на последовательный порт: " + msg
 		}
 	}
 }
 
-// Отправление сообщения к клиенту
-func handleMessages() {
-	for {
-		msg := <-broadcast
-		log.Println("Отправка сообщения:", msg)
-
-		for client := range clients {
-			err := client.WriteMessage(websocket.TextMessage, []byte(msg))
-			if err != nil {
-				log.Printf("Ошибка записи сообщения клиенту: %v", err)
-				client.Close()
-				delete(clients, client)
-			}
-		}
+// Функция для отправки списка портов клиентам по WebSocket
+func sendPortList() error {
+	ports := getPortNames()
+	data, err := json.Marshal(ports)
+	if err != nil {
+		broadcast <- fmt.Sprintf("Ошибка при маршалинге списка портов: %v", err)
+		return err
 	}
+
+	message := fmt.Sprintf("Получен новый список портов: %v", ports)
+	broadcast <- message
+	broadcast <- string(data)
+
+	return nil
 }
 
-// Структура отправляемого сообщения клиенту
-func notifyClients(message string) {
-	for client := range clients {
-		err := client.WriteMessage(websocket.TextMessage, []byte(message))
-		if err != nil {
-			log.Printf("Ошибка отправки сообщения клиенту: %v", err)
+// Функция для получения списка доступных портов
+func getPortNames() []string {
+	var ports []string
+
+	switch {
+	case isWindows():
+		ports = getWindowsPortNames()
+	default:
+		//ports = getUnixPortNames()
+	}
+
+	return ports
+}
+
+// Функция для определения операционной системы Windows
+func isWindows() bool {
+	return os.PathSeparator == '\\' && os.Getenv("WINDIR") != ""
+}
+
+// Функция для получения списка COM-портов в Windows
+func getWindowsPortNames() []string {
+	var ports []string
+
+	for i := 1; i <= 256; i++ {
+		port := "COM" + strconv.Itoa(i)
+		_, err := os.Stat(port)
+		if !os.IsNotExist(err) {
+			ports = append(ports, port)
 		}
 	}
+
+	return ports
 }
