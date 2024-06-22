@@ -46,7 +46,8 @@ var (
 )
 
 func main() {
-	flag.StringVar(&webAddress, "address", ":8080", "адрес для подключения")
+	flag.StringVar(&webAddress, "address", "localhost:8080", "адрес для подключения")
+	flag.Parse()
 
 	http.HandleFunc("/serialmonitor", handleConnections)
 
@@ -54,7 +55,7 @@ func main() {
 	go manageSerialConnection()
 	go writeToSerial()
 
-	log.Println("Запускаем сервер :8080")
+	log.Printf("Запускаем сервер %s", webAddress)
 	log.Fatal(http.ListenAndServe(webAddress, nil))
 }
 
@@ -292,7 +293,13 @@ func sendPortList() error {
 		return err
 	}
 
-	message := fmt.Sprintf("Получен новый список портов: %v", ports)
+	var message string
+	if len(ports) == 0 {
+		message = "Доступные последовательные порты отсутствуют."
+	} else {
+		message = fmt.Sprintf("Получен новый список портов: %v", ports)
+	}
+
 	broadcast <- message
 	broadcast <- string(data)
 
